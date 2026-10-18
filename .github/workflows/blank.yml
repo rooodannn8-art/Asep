@@ -1,144 +1,83 @@
-name: Secure RDP over Tailscale
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Validate required secrets
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw 'Missing GitHub Actions secret: TAILSCALE_AUTH_KEY'
-          }
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or $env:RDP_PASSWORD.Length -lt 16) {
-            throw 'Set the GitHub Actions secret RDP_PASSWORD to a unique password of at least 16 characters.'
-          }
-
-      - name: Configure RDP securely
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-
-          # Enable RDP while keeping Network Level Authentication (NLA) enabled.
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0 -Type DWord
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' -Value 1 -Type DWord
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' -Value 2 -Type DWord
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'MinEncryptionLevel' -Value 3 -Type DWord
-
-          # Remove only this workflow's prior rule, then allow RDP only from Tailscale's CGNAT range.
-          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-          New-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' `
-            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
-            -RemoteAddress '100.64.0.0/10' -Profile Any
-
-          Set-Service -Name TermService -StartupType Manual
-          Restart-Service -Name TermService -Force
-
-      - name: Create least-privilege RDP user
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $username = 'rdp-user'
-          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name $username
-          }
-          New-LocalUser -Name $username -Password $securePass `
-            -Description 'Temporary RDP account for this workflow run' `
-            -AccountNeverExpires | Out-Null
-          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username
-          # Do not add this account to Administrators.
-
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            throw 'RDP user creation failed.'
-          }
-
-      - name: Install Tailscale
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
-          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          try {
-            $process = Start-Process -FilePath 'msiexec.exe' `
-              -ArgumentList @('/i', $installerPath, '/quiet', '/norestart') `
-              -Wait -PassThru
-            if ($process.ExitCode -notin @(0, 3010)) {
-              throw "Tailscale installer failed with exit code $($process.ExitCode)."
-            }
-          }
-          finally {
-            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-          }
-
-      - name: Connect to Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable not found at $tsExe"
-          }
-
-          # Store the auth key in an environment variable; never echo it or write it to the summary.
-          & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale failed to connect (exit code $LASTEXITCODE)."
-          }
-
-          $tsIP = (& $tsExe ip -4 | Select-Object -First 1).Trim()
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-            throw 'Could not determine the Tailscale IPv4 address.'
-          }
-          "### Temporary RDP connection details" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "- Tailscale IP: $tsIP" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          '- Username: `rdp-user`' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          '- Password: use the value stored in your GitHub Actions secret `RDP_PASSWORD`.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          '- Connect only from a device authorized on your Tailscale network.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-
-      - name: Keep runner available
-        shell: pwsh
-        run: |
-          Write-Host 'RDP is available only while this GitHub Actions job is running.'
-          Write-Host 'Stop or cancel the workflow when finished. Do not share the Tailscale auth key or RDP password.'
-          Start-Sleep -Seconds 21000
-
-      - name: Clean up access settings
-        if: always()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          if (Test-Path $tsExe) {
-            & $tsExe logout
-          }
-          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 1 -Type DWord
-          Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
-          Remove-LocalUser -Name 'rdp-user' -ErrorAction SilentlyContinue
+- name: Setup Java JDK
+  uses: actions/setup-java@v6.1.0
+  with:
+    # The Java version to set up. Takes a whole or semver Java version, or the "latest" alias to use the newest available stable release. See examples of supported syntax in README file
+    java-version: # optional
+    # The path to a file containing the Java version to set up (.java-version, .tool-versions, .sdkmanrc). Used when java-version is not set. See examples of supported syntax in README file
+    java-version-file: # optional
+    # Java distribution. See the list of supported distributions in README file. This input is required except when java-version-file points to .sdkmanrc with a recognized distribution suffix (e.g., java=21.0.5-tem).
+    distribution: # optional
+    # The package type (`jdk`, `jre`, `jdk+fx`, `jre+fx`, `jdk+crac`, `jre+crac`, `jdk+jmods`, `jdk+jcef`, `jre+jcef`, `jdk+ft`, or `jre+ft`). Supported values vary by distribution.
+    java-package: # optional, default is jdk
+    # The architecture of the package (`x86`, `x64`, `armv7`, `aarch64`, `ppc64le`, `ppc64`, `riscv64`, or `s390x`). Aliases `ia32`, `amd64`, `arm`, and `arm64` are normalized to `x86`, `x64`, `armv7`, and `aarch64`. Supported values vary by distribution and operating system. Defaults to the action runner's architecture.
+    architecture: # optional
+    # Path to where the compressed JDK is located
+    jdk-file: # optional
+    # Deprecated alias for `jdk-file`. Path to where the compressed JDK is located. Use `jdk-file` instead; this alias may be removed in a future release.
+    jdkFile: # optional
+    # Set this option if you want the action to check for the latest available version that satisfies the version spec
+    check-latest: # optional
+    # Set this option to always download Java and replace any matching version in the tool cache
+    force-download: # optional
+    # Set this option to false if you want to install a JDK but not make it the default. When false, JAVA_HOME and PATH are not updated, but JAVA_HOME_<major>_<arch> is still set.
+    set-default: # optional, default is true
+    # Check downloaded Java package signatures when supported by the selected distribution. When omitted, failures produce warnings. Explicitly setting this to true enforces verification and makes failures fatal, including failures caused by an unexpected vendor signing-key rotation.
+    verify-signature: # optional
+    # One or more ASCII-armored GPG public keys used to verify downloaded package signatures. Concatenate multiple armored key blocks. Custom keys replace the bundled keys for the selected distribution.
+    verify-signature-public-key: # optional
+    # ID of the distributionManagement repository in the pom.xml file. Default is `github`
+    server-id: # optional, default is github
+    # Environment variable name for the username for authentication to the Apache Maven repository. Default is $GITHUB_ACTOR
+    server-username-env-var: # optional
+    # Deprecated alias for server-username-env-var
+    server-username: # optional
+    # Environment variable name for password or token for authentication to the Apache Maven repository. Default is $GITHUB_TOKEN
+    server-password-env-var: # optional
+    # Deprecated alias for server-password-env-var
+    server-password: # optional
+    # Multiline list of Maven server credentials in the format `server-id:USERNAME_ENV:PASSWORD_ENV`. When set, replaces the single server configured by server-id, server-username-env-var, and server-password-env-var.
+    mvn-server-credentials: # optional
+    # Multiline list of Maven credential origins in the format `server-id:repository-origin`. Each origin must belong to a configured server ID. Requires Maven 3.10+.
+    mvn-server-repository-origins: # optional
+    # Multiline list of Maven dependency repositories in the format `repository-id:repository-url:snapshots-enabled`.
+    mvn-repositories: # optional
+    # Multiline list of Maven plugin repositories in the format `repository-id:repository-url:snapshots-enabled`.
+    mvn-plugin-repositories: # optional
+    # Include Maven Central for dependency and plugin repositories in the generated profile. When false, Central is disabled for both types unless that type explicitly declares ID `central`. Has no effect when neither repository list is configured.
+    mvn-repositories-include-central: # optional, default is true
+    # Place Maven Central before custom dependency and plugin repositories. Has no effect when Maven Central is excluded or neither repository list is configured.
+    mvn-repositories-prioritize-central: # optional, default is true
+    # Path to where the settings.xml file will be written. Default is ~/.m2.
+    settings-path: # optional
+    # Overwrite the settings.xml file if it exists. Default is "true".
+    overwrite-settings: # optional, default is true
+    # GPG private key to import into an isolated temporary keyring. Default is empty string.
+    gpg-private-key: # optional, default is 
+    # Environment variable name for the GPG private key passphrase. Defaults to GPG_PASSPHRASE when gpg-private-key is set.
+    gpg-passphrase-env-var: # optional
+    # Deprecated alias for gpg-passphrase-env-var
+    gpg-passphrase: # optional
+    # Name of the build platform to cache dependencies. It can be "maven", "gradle" or "sbt".
+    cache: # optional
+    # Cache downloaded JDK installations between jobs. Defaults to enabled when dependency caching is configured with `cache`; set explicitly to "true" or "false" to override.
+    cache-jdk: # optional
+    # The path to a dependency file: pom.xml, build.gradle, build.sbt, etc. This option can be used with the `cache` option. If this option is omitted, the action searches for the dependency file in the entire repository. This option supports wildcards and a list of file names for caching multiple dependencies.
+    cache-dependency-path: # optional
+    # The path to cache instead of the default dependency cache path for the selected package manager. This option can be used with the `cache` option and supports a list of paths and exclusion patterns.
+    cache-path: # optional
+    # Restore caches without saving cache changes in the post action.
+    cache-read-only: # optional
+    # Workaround to pass job status to post job step. This variable is not intended for manual setting
+    job-status: # optional, default is ${{ job.status }}
+    # The token used to authenticate when fetching version manifests hosted on github.com, such as for the Microsoft Build of OpenJDK. When running this action on github.com, the default value is sufficient. When running on GHES, you can pass a personal access token for github.com if you are experiencing rate limiting.
+    token: # optional, default is ${{ github.server_url == 'https://github.com' && github.token || '' }}
+    # Name of Maven Toolchain ID if the default name of "${mvn-toolchain-vendor}_${java-version}" is not wanted. The toolchain vendor defaults to the "distribution" input. When supplied, the number of IDs must match the number of Java versions. See examples of supported syntax in Advanced Usage file
+    mvn-toolchain-id: # optional
+    # Name of Maven Toolchain Vendor if the default name of "${distribution}" is not wanted. See examples of supported syntax in Advanced Usage file
+    mvn-toolchain-vendor: # optional
+    # Whether Maven should print artifact download/transfer progress to the build log. When "false" (default) the action sets "-ntp" (--no-transfer-progress) in MAVEN_ARGS to produce cleaner logs. Set to "true" to keep the progress output. Has no effect on non-Maven builds.
+    show-download-progress: # optional
+    # Whether to register the Java problem matcher (compiler errors/warnings and uncaught exceptions). Set to "false" to disable annotations.
+    problem-matcher: # optional, default is true
     
           
