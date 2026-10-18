@@ -1,0 +1,143 @@
+name: Secure RDP over Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Validate required secrets
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw 'Missing GitHub Actions secret: TAILSCALE_AUTH_KEY'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or $env:RDP_PASSWORD.Length -lt 16) {
+            throw 'Set the GitHub Actions secret RDP_PASSWORD to a unique password of at least 16 characters.'
+          }
+
+      - name: Configure RDP securely
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Enable RDP while keeping Network Level Authentication (NLA) enabled.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2 -Type DWord
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'MinEncryptionLevel' -Value 3 -Type DWord
+
+          # Remove only this workflow's prior rule, then allow RDP only from Tailscale's CGNAT range.
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' -Profile Any
+
+          Set-Service -Name TermService -StartupType Manual
+          Restart-Service -Name TermService -Force
+
+      - name: Create least-privilege RDP user
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $username = 'rdp-user'
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $username
+          }
+          New-LocalUser -Name $username -Password $securePass `
+            -Description 'Temporary RDP account for this workflow run' `
+            -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username
+          # Do not add this account to Administrators.
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            throw 'RDP user creation failed.'
+          }
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tsUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+          $installerPath = Join-Path $env:TEMP 'tailscale.msi'
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          try {
+            $process = Start-Process -FilePath 'msiexec.exe' `
+              -ArgumentList @('/i', $installerPath, '/quiet', '/norestart') `
+              -Wait -PassThru
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installer failed with exit code $($process.ExitCode)."
+            }
+          }
+          finally {
+            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Connect to Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale executable not found at $tsExe"
+          }
+
+          # Store the auth key in an environment variable; never echo it or write it to the summary.
+          & $tsExe up "--authkey=$env:TAILSCALE_AUTH_KEY" "--hostname=gh-runner-$env:GITHUB_RUN_ID"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale failed to connect (exit code $LASTEXITCODE)."
+          }
+
+          $tsIP = (& $tsExe ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            throw 'Could not determine the Tailscale IPv4 address.'
+          }
+          "### Temporary RDP connection details" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "- Tailscale IP: $tsIP" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '- Username: `rdp-user`' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '- Password: use the value stored in your GitHub Actions secret `RDP_PASSWORD`.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          '- Connect only from a device authorized on your Tailscale network.' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Keep runner available
+        shell: pwsh
+        run: |
+          Write-Host 'RDP is available only while this GitHub Actions job is running.'
+          Write-Host 'Stop or cancel the workflow when finished. Do not share the Tailscale auth key or RDP password.'
+          Start-Sleep -Seconds 21000
+
+      - name: Clean up access settings
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tsExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (Test-Path $tsExe) {
+            & $tsExe logout
+          }
+          Get-NetFirewallRule -DisplayName 'RDP-Tailscale-Only' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 1 -Type DWord
+          Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          Remove-LocalUser -Name 'rdp-user' -ErrorAction SilentlyContinue
+          
