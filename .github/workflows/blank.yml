@@ -140,4 +140,5 @@ jobs:
             -Name 'fDenyTSConnections' -Value 1 -Type DWord
           Stop-Service -Name TermService -Force -ErrorAction SilentlyContinue
           Remove-LocalUser -Name 'rdp-user' -ErrorAction SilentlyContinue
+    
           
